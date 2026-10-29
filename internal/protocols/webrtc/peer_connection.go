@@ -27,8 +27,12 @@ const (
 	twccExtensionURI = "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
 )
 
-func interfaceIPs(interfaceList []string, excludeList []string) ([]string, error) {
-	intfs, err := net.Interfaces()
+func interfaceIPs(tnet transport.Net, interfaceList []string, excludeList []string) ([]string, error) {
+	if tnet == nil {
+		tnet = &Net{}
+	}
+
+	intfs, err := tnet.Interfaces()
 	if err != nil {
 		return nil, err
 	}
@@ -488,7 +492,7 @@ func (co *PeerConnection) removeUnwantedCandidates(firstMedia *sdp.MediaDescript
 	var allowedIPs []string
 	if co.IPsFromInterfaces {
 		var err error
-		allowedIPs, err = interfaceIPs(co.IPsFromInterfacesList, co.IPsFromInterfacesExcludeList)
+		allowedIPs, err = interfaceIPs(co.Net, co.IPsFromInterfacesList, co.IPsFromInterfacesExcludeList)
 		if err != nil {
 			return err
 		}

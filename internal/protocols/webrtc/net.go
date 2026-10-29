@@ -3,6 +3,8 @@ package webrtc
 import (
 	"fmt"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/bluenviron/gortsplib/v5/pkg/readbuffer"
 	"github.com/pion/transport/v5"
@@ -10,18 +12,45 @@ import (
 	"github.com/wlynxg/anet"
 )
 
+// interfacesTTL is how long Interfaces() reuses the last list.
+// Listing interfaces is expensive on Windows, where the addresses of each interface
+// need a separate GetAdaptersAddresses call, and a session lists them several times.
+// The TTL is short enough to still follow network changes.
+const interfacesTTL = 5 * time.Second
+
 // Net is stdnet.Net with the following changes:
-// - Interfaces() is overridden to query the OS directly on every call without caching.
-// - ListenUDP() is overridden to apply the configured read buffer size to the returned UDPConn.
+//   - Interfaces() is overridden to query the OS directly, caching the result for a few seconds only.
+//   - ListenUDP() is overridden to apply the configured read buffer size to the returned UDPConn.
 type Net struct {
 	UDPReadBufferSize int
 
 	stdnet.Net
+
+	mutex       sync.Mutex
+	ifs         []*transport.Interface
+	ifsExpireAt time.Time
 }
 
-// Interfaces returns the current list of network interfaces by querying the OS
-// on every call, with no caching.
+// Interfaces returns the current list of network interfaces.
+// The OS is queried again once the previous result is older than interfacesTTL.
 func (n *Net) Interfaces() ([]*transport.Interface, error) {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+
+	now := time.Now()
+	if n.ifs == nil || !now.Before(n.ifsExpireAt) {
+		ifs, err := queryInterfaces()
+		if err != nil {
+			return nil, err
+		}
+		n.ifs = ifs
+		n.ifsExpireAt = now.Add(interfacesTTL)
+	}
+
+	return append([]*transport.Interface(nil), n.ifs...), nil
+}
+
+func queryInterfaces() ([]*transport.Interface, error) {
 	oifs, err := anet.Interfaces()
 	if err != nil {
 		return nil, err
