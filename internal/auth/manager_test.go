@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1203,6 +1204,99 @@ func TestAuthJWTRefresh(t *testing.T) {
 
 		m.RefreshJWTJWKS()
 	}
+}
+
+func TestAuthJWTUnknownKID(t *testing.T) {
+	// The issuer rotates its key: the first token signed with the new one makes the JWKS
+	// fetched again, without RefreshJWTJWKS; another unknown key soon after doesn't.
+	var (
+		mu    sync.Mutex
+		key   *rsa.PrivateKey
+		kid   string
+		pulls int
+	)
+	rotate := func(newKID string) {
+		k, err := rsa.GenerateKey(rand.Reader, 1024)
+		require.NoError(t, err)
+		mu.Lock()
+		defer mu.Unlock()
+		key, kid = k, newKID
+	}
+	rotate("key-1")
+
+	httpServ := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		pulls++
+		jwk, err := jwkset.NewJWKFromKey(key, jwkset.JWKOptions{Metadata: jwkset.JWKMetadataOptions{KID: kid}})
+		require.NoError(t, err)
+		jwkSet := jwkset.NewMemoryStorage()
+		require.NoError(t, jwkSet.KeyWrite(context.Background(), jwk))
+		response, err := jwkSet.JSONPublic(r.Context())
+		require.NoError(t, err)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(response)
+	}))
+	defer httpServ.Close()
+
+	m := Manager{
+		Parent:      nilLogger{},
+		Method:      conf.AuthMethodJWT,
+		JWTJWKS:     httpServ.URL,
+		JWTClaimKey: "my_permission_key",
+	}
+	m.Initialize()
+
+	authenticate := func() error {
+		mu.Lock()
+		signer, signerKID := key, kid
+		mu.Unlock()
+
+		type customClaims struct {
+			jwt.RegisteredClaims
+			MediaMTXPermissions []conf.AuthInternalUserPermission `json:"my_permission_key"`
+		}
+		token := jwt.NewWithClaims(jwt.SigningMethodRS256, customClaims{
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+				Subject:   "somebody",
+			},
+			MediaMTXPermissions: []conf.AuthInternalUserPermission{{Action: conf.AuthActionRead, Path: "mypath"}},
+		})
+		token.Header[jwkset.HeaderKID] = signerKID
+		ss, err := token.SignedString(signer)
+		require.NoError(t, err)
+
+		_, err2 := m.Authenticate(&Request{
+			Action:      conf.AuthActionRead,
+			Path:        "mypath",
+			Protocol:    ProtocolWebRTC,
+			Credentials: &Credentials{Token: ss},
+			IP:          net.ParseIP("127.0.0.1"),
+		})
+		if err2 != nil {
+			return err2
+		}
+		return nil
+	}
+
+	require.NoError(t, authenticate())
+	require.Equal(t, 1, pulls)
+
+	rotate("key-2")
+	require.NoError(t, authenticate())
+	require.Equal(t, 2, pulls)
+
+	// A third key within jwksUnknownKIDPeriod: refused without a fetch.
+	rotate("key-3")
+	require.Error(t, authenticate())
+	require.Equal(t, 2, pulls)
+
+	// After the period it is fetched and accepted.
+	jwksUnknownKIDPeriod = 0
+	defer func() { jwksUnknownKIDPeriod = 10 * time.Second }()
+	require.NoError(t, authenticate())
+	require.Equal(t, 3, pulls)
 }
 
 func TestAuthJWTFingerprint(t *testing.T) {

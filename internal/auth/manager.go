@@ -4,6 +4,7 @@ package auth
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MicahParks/jwkset"
 	"github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -27,6 +29,10 @@ const (
 	maxInboundBodySize = 128 * 1024
 	jwksRefreshPeriod  = 60 * 60 * time.Second
 )
+
+// jwksUnknownKIDPeriod is how often a token signed with an unknown key ID may trigger a JWKS fetch:
+// the issuer has rotated its keys, so the new key is fetched without a reload.
+var jwksUnknownKIDPeriod = 10 * time.Second
 
 func isHTTP(req *Request) bool {
 	return req.Protocol == ProtocolHLS || req.Protocol == ProtocolWebRTC ||
@@ -111,6 +117,7 @@ type Manager struct {
 	wrapTransport   func(http.RoundTripper) http.RoundTripper
 	mutex           sync.RWMutex
 	jwksLastRefresh time.Time
+	jwksLastUnknown time.Time
 	jwtKeyFunc      keyfunc.Keyfunc
 }
 
@@ -302,6 +309,14 @@ func (m *Manager) authenticateJWT(req *Request, token string) (*Result, error) {
 	var cc jwtClaims
 	cc.permissionsKey = m.JWTClaimKey
 	_, err = jwt.ParseWithClaims(token, &cc, keyfunc, opts...)
+	if err != nil && errors.Is(err, jwkset.ErrKeyNotFound) && m.refreshForUnknownKID() {
+		keyfunc, err = m.pullJWTJWKS()
+		if err != nil {
+			return nil, err
+		}
+		cc = jwtClaims{permissionsKey: m.JWTClaimKey}
+		_, err = jwt.ParseWithClaims(token, &cc, keyfunc, opts...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -361,6 +376,22 @@ func (m *Manager) pullJWTJWKS() (jwt.Keyfunc, error) {
 	}
 
 	return m.jwtKeyFunc.Keyfunc, nil
+}
+
+// refreshForUnknownKID marks the JWKS stale after a token named a key it doesn't hold, at most once
+// per jwksUnknownKIDPeriod, so tokens with made-up key IDs can't make it fetch on every request.
+func (m *Manager) refreshForUnknownKID() bool {
+	now := time.Now()
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if now.Sub(m.jwksLastUnknown) < jwksUnknownKIDPeriod {
+		return false
+	}
+	m.jwksLastUnknown = now
+	m.jwksLastRefresh = time.Time{}
+	return true
 }
 
 // RefreshJWTJWKS refreshes the JWT JWKS.
