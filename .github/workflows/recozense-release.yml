@@ -1,0 +1,119 @@
+# RecoZense release: the MediaMTX binaries Video Wall Player ships.
+#
+# Push a tag such as v1.21.3-recozense.2 (annotated; its message becomes the release notes) and this
+# builds Windows x64, Linux x64, Linux arm64 and Android arm64 and publishes a GitHub release.
+# Run it by hand (Actions > recozense-release > Run workflow) with publish off to build a tag
+# without releasing: the files are kept as the run's artifact and the checksums are in its summary.
+#
+# The build is reproducible: the same commit, Go version and command give the same bytes on any
+# machine, so a release can be checked by rebuilding it. It must stay the same as video-wall-player's
+# tools/mediamtx.mjs and resources/mediamtx/manifest.json ("build"), whose checksums are the binaries'.
+# Upstream's release.yml (Docker Hub, upstream issues) is disabled in this fork.
+
+name: recozense-release
+
+on:
+  push:
+    tags:
+      - "v*-recozense.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build, e.g. v1.21.3-recozense.1"
+        required: true
+      publish:
+        description: "Publish a GitHub release (off: build only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: "1.27.3"
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          fetch-depth: 0
+
+      # The annotated tag itself (checkout may leave only the commit).
+      - run: git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Build
+        env:
+          GOTOOLCHAIN: local
+          CGO_ENABLED: "0"
+        run: |
+          set -eu
+          go version
+          go generate ./...
+          printf '%s' "$TAG" > internal/core/VERSION
+          for t in windows/amd64/mediamtx.exe linux/amd64/mediamtx linux/arm64/mediamtx android/arm64/libmediamtx.so; do
+            IFS=/ read -r os arch file <<< "$t"
+            mkdir -p "out/$os-$arch"
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -checklinkname=0" -o "out/$os-$arch/$file" .
+          done
+          test -z "$(git status --porcelain --untracked-files=no)" || { git status; echo "the checkout changed while building"; exit 1; }
+
+      - name: Package
+        run: |
+          set -eu
+          mkdir -p dist
+          for d in windows-amd64 linux-amd64 linux-arm64 android-arm64; do
+            rm -rf pkg && mkdir pkg
+            cp out/$d/* LICENSE pkg/
+            [ "$d" = android-arm64 ] || cp mediamtx.yml pkg/
+            name="mediamtx_${TAG}_${d/-/_}"
+            if [ "$d" = windows-amd64 ]; then
+              (cd pkg && zip -qX "../dist/$name.zip" *)
+            else
+              tar -C pkg --owner=0 --group=0 --sort=name -czf "dist/$name.tar.gz" .
+            fi
+          done
+          (cd dist && sha256sum * > checksums.sha256)
+
+      - name: Notes and summary
+        run: |
+          set -eu
+          {
+            git tag -l --format='%(contents)' "$TAG" | sed '/-----BEGIN PGP SIGNATURE-----/,$d' | tail -n +3
+            echo
+            echo "## Binaries (SHA-256, as in video-wall-player's resources/mediamtx/manifest.json)"
+            echo
+            echo '```'
+            for f in out/*/*; do printf '%s  %s  %s bytes\n' "$(sha256sum "$f" | cut -d' ' -f1)" "${f#out/}" "$(stat -c %s "$f")"; done
+            echo '```'
+            echo
+            echo "Built by the [recozense-release workflow](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) with Go ${GO_VERSION} from \`$(git rev-parse --short=8 HEAD)\`. Licence: MIT (MediaMTX, https://github.com/bluenviron/mediamtx)."
+          } > notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mediamtx-${{ env.TAG }}
+          path: |
+            dist
+            notes.md
+
+      - name: Publish the release
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG already exists: not changed"; exit 1
+          fi
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md dist/*
