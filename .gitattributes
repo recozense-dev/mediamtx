@@ -1,0 +1,4 @@
+# LF everywhere, also on Windows: files embedded in the binary keep their line endings,
+# so a Windows checkout must match the release build (.github/workflows/recozense-release.yml).
+* text=auto eol=lf
+*.svg -text
