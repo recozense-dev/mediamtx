@@ -62,10 +62,10 @@ jobs:
           printf '%s' "$TAG" > internal/core/VERSION
           for t in windows/amd64/mediamtx.exe linux/amd64/mediamtx linux/arm64/mediamtx android/arm64/libmediamtx.so; do
             IFS=/ read -r os arch file <<< "$t"
-            mkdir -p "out/$os-$arch"
-            GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -checklinkname=0" -o "out/$os-$arch/$file" .
+            mkdir -p "$RUNNER_TEMP/out/$os-$arch"
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -checklinkname=0" -o "$RUNNER_TEMP/out/$os-$arch/$file" .
           done
-          test -z "$(git status --porcelain --untracked-files=no)" || { git status; echo "the checkout changed while building"; exit 1; }
+          test -z "$(git status --porcelain)" || { git status; echo "the checkout changed while building"; exit 1; }
 
       - name: Package
         run: |
@@ -73,7 +73,7 @@ jobs:
           mkdir -p dist
           for d in windows-amd64 linux-amd64 linux-arm64 android-arm64; do
             rm -rf pkg && mkdir pkg
-            cp out/$d/* LICENSE pkg/
+            cp "$RUNNER_TEMP/out/$d/"* LICENSE pkg/
             [ "$d" = android-arm64 ] || cp mediamtx.yml pkg/
             name="mediamtx_${TAG}_${d/-/_}"
             if [ "$d" = windows-amd64 ]; then
@@ -93,7 +93,7 @@ jobs:
             echo "## Binaries (SHA-256, as in video-wall-player's resources/mediamtx/manifest.json)"
             echo
             echo '```'
-            for f in out/*/*; do printf '%s  %s  %s bytes\n' "$(sha256sum "$f" | cut -d' ' -f1)" "${f#out/}" "$(stat -c %s "$f")"; done
+            for f in "$RUNNER_TEMP"/out/*/*; do printf '%s  %s  %s bytes\n' "$(sha256sum "$f" | cut -d' ' -f1)" "${f#$RUNNER_TEMP/out/}" "$(stat -c %s "$f")"; done
             echo '```'
             echo
             echo "Built by the [recozense-release workflow](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) with Go ${GO_VERSION} from \`$(git rev-parse --short=8 HEAD)\`. Licence: MIT (MediaMTX, https://github.com/bluenviron/mediamtx)."
